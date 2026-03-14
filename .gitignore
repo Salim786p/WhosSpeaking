@@ -1,0 +1,7 @@
+backend/.venv/
+backend/artifacts/
+backend/workspace/
+frontend/node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
