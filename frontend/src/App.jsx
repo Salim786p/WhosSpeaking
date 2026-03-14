@@ -29,7 +29,8 @@ const theoryCards = [
 
 const pipelineSteps = [
   'Upload a zipped training corpus organised into speaker folders.',
-  'Extract a 36-dimensional feature vector from every utterance.',
+  'Split long recordings into voiced overlapping segments before feature extraction.',
+  'Extract a 36-dimensional feature vector from every segment.',
   'Normalize the features with StandardScaler and train an SVM with an rbf kernel.',
   "Reject unknown voices when the prediction confidence falls below 60 percent.",
 ]
@@ -297,7 +298,8 @@ function App() {
               Upload a single archive where each folder name is a speaker label. Supported audio
               files are <span className="font-semibold text-white">.wav</span>,{' '}
               <span className="font-semibold text-white">.mp3</span>, and{' '}
-              <span className="font-semibold text-white">.flac</span>.
+              <span className="font-semibold text-white">.flac</span>. Long recordings are
+              automatically split into voiced 3-second windows with 1.5-second overlap.
             </p>
 
             <label className="upload-shell">
@@ -323,8 +325,8 @@ function App() {
               <div className="rounded-2xl border border-cyan-glow/20 bg-cyan-glow/8 p-4">
                 <p className="text-sm font-semibold text-cyan-glow">Processing acoustic evidence</p>
                 <p className="mt-2 text-sm text-slate-200">
-                  Computing frame energy, ZCR, LPC resonances, log-mel summaries, scaling, and
-                  probability calibration.
+                  Detecting voiced regions, creating segment windows, computing energy, ZCR, LPC,
+                  and log-mel summaries, then scaling and fitting the SVM.
                 </p>
                 <div className="mt-4 flex gap-2" aria-hidden="true">
                   <span className="scan-pill scan-pill-1" />
@@ -364,7 +366,7 @@ function App() {
                     </strong>
                   </div>
                   <div className="mini-stat">
-                    <span className="mini-stat-label">Utterances</span>
+                    <span className="mini-stat-label">Segments</span>
                     <strong className="mini-stat-value">
                       {trainingResult.training_summary.sample_count}
                     </strong>
@@ -379,7 +381,9 @@ function App() {
                   {speakerSummary.map((speaker) => (
                     <div key={speaker.name} className="speaker-pill">
                       <span className="font-semibold text-white">{speaker.name}</span>
-                      <span className="text-sm text-muted">{speaker.utterances} files</span>
+                      <span className="text-sm text-muted">
+                        {speaker.segments} segments • {speaker.source_files} files
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -481,6 +485,11 @@ function App() {
                         </strong>
                       </div>
                     </div>
+
+                    <p className="mt-4 text-sm leading-6 text-muted">
+                      Decision aggregated across {predictionResult.segment_count} segment
+                      {predictionResult.segment_count === 1 ? '' : 's'}.
+                    </p>
 
                     <p className="mt-4 text-sm leading-6 text-slate-200">
                       {predictionResult.message}

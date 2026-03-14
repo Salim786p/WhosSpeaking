@@ -30,6 +30,10 @@ class AudioConfig:
     hop_duration: float = 0.010
     lpc_order: int = 12
     n_mels: int = 20
+    segment_duration: float = 3.0
+    segment_hop_duration: float = 1.5
+    min_segment_duration: float = 1.0
+    merge_silence_duration: float = 0.20
 
     @property
     def frame_length(self) -> int:
@@ -38,6 +42,22 @@ class AudioConfig:
     @property
     def hop_length(self) -> int:
         return int(self.sample_rate * self.hop_duration)
+
+    @property
+    def segment_length(self) -> int:
+        return int(self.sample_rate * self.segment_duration)
+
+    @property
+    def segment_hop_length(self) -> int:
+        return int(self.sample_rate * self.segment_hop_duration)
+
+    @property
+    def min_segment_length(self) -> int:
+        return int(self.sample_rate * self.min_segment_duration)
+
+    @property
+    def merge_gap_frames(self) -> int:
+        return max(1, int(self.merge_silence_duration / self.hop_duration))
 
 
 CONFIG = AudioConfig()
@@ -63,6 +83,7 @@ def feature_dimension() -> int:
 
 
 def _normalize_signal(signal: np.ndarray) -> np.ndarray:
+    signal = np.asarray(signal, dtype=np.float32)
     if signal.size == 0:
         raise ValueError("Audio signal is empty.")
 
@@ -70,6 +91,11 @@ def _normalize_signal(signal: np.ndarray) -> np.ndarray:
     if peak > 0:
         signal = signal / peak
     return signal.astype(np.float32)
+
+
+def load_audio_signal(audio_path: Path | str) -> np.ndarray:
+    signal, _ = librosa.load(audio_path, sr=CONFIG.sample_rate, mono=True)
+    return _normalize_signal(signal)
 
 
 def _frame_signal(signal: np.ndarray) -> np.ndarray:
@@ -136,8 +162,7 @@ def _mel_summary(signal: np.ndarray) -> np.ndarray:
     return np.mean(log_mel_spectrogram, axis=1).astype(np.float32)
 
 
-def extract_feature_vector(audio_path: Path | str) -> np.ndarray:
-    signal, _ = librosa.load(audio_path, sr=CONFIG.sample_rate, mono=True)
+def extract_feature_vector_from_signal(signal: np.ndarray) -> np.ndarray:
     signal = _normalize_signal(signal)
     frames = _frame_signal(signal)
 
@@ -146,7 +171,7 @@ def extract_feature_vector(audio_path: Path | str) -> np.ndarray:
     lpc = _lpc_summary(frames, energies)
     mel = _mel_summary(signal)
 
-    feature_vector = np.concatenate(
+    return np.concatenate(
         [
             np.array([np.mean(energies), np.std(energies)], dtype=np.float32),
             np.array([np.mean(zcr), np.std(zcr)], dtype=np.float32),
@@ -154,7 +179,112 @@ def extract_feature_vector(audio_path: Path | str) -> np.ndarray:
             mel,
         ]
     )
-    return feature_vector
+
+
+def extract_feature_vector(audio_path: Path | str) -> np.ndarray:
+    signal = load_audio_signal(audio_path)
+    return extract_feature_vector_from_signal(signal)
+
+
+def _energy_activity_threshold(energies: np.ndarray) -> float:
+    low_energy = float(np.percentile(energies, 35))
+    high_energy = float(np.percentile(energies, 90))
+    return max(1e-6, low_energy + (0.25 * max(0.0, high_energy - low_energy)))
+
+
+def _frame_region_to_samples(
+    start_frame: int, end_frame: int, signal_length: int
+) -> tuple[int, int]:
+    start_sample = start_frame * CONFIG.hop_length
+    end_sample = min(signal_length, (end_frame * CONFIG.hop_length) + CONFIG.frame_length)
+    return start_sample, end_sample
+
+
+def _speech_regions(signal: np.ndarray) -> list[tuple[int, int]]:
+    frames = _frame_signal(signal)
+    energies = _short_term_energy(frames)
+    activity_threshold = _energy_activity_threshold(energies)
+    active_mask = energies >= activity_threshold
+
+    if not np.any(active_mask):
+        return [(0, signal.size)]
+
+    regions: list[tuple[int, int]] = []
+    region_start: int | None = None
+    last_active_frame: int | None = None
+
+    for frame_index, is_active in enumerate(active_mask):
+        if is_active:
+            if region_start is None:
+                region_start = frame_index
+            last_active_frame = frame_index
+            continue
+
+        if region_start is None or last_active_frame is None:
+            continue
+
+        if frame_index - last_active_frame >= CONFIG.merge_gap_frames:
+            regions.append(
+                _frame_region_to_samples(region_start, last_active_frame, signal.size)
+            )
+            region_start = None
+            last_active_frame = None
+
+    if region_start is not None and last_active_frame is not None:
+        regions.append(_frame_region_to_samples(region_start, last_active_frame, signal.size))
+
+    filtered_regions = [
+        region
+        for region in regions
+        if (region[1] - region[0]) >= CONFIG.min_segment_length
+    ]
+    return filtered_regions or [(0, signal.size)]
+
+
+def _segment_indices_from_region(
+    region_start: int, region_end: int
+) -> list[tuple[int, int]]:
+    region_length = region_end - region_start
+    if region_length < CONFIG.min_segment_length:
+        return []
+
+    if region_length <= CONFIG.segment_length:
+        return [(region_start, region_end)]
+
+    segments: list[tuple[int, int]] = []
+    current_start = region_start
+    while current_start + CONFIG.segment_length <= region_end:
+        segments.append((current_start, current_start + CONFIG.segment_length))
+        current_start += CONFIG.segment_hop_length
+
+    tail_start = max(region_start, region_end - CONFIG.segment_length)
+    if not segments or tail_start > segments[-1][0]:
+        segments.append((tail_start, region_end))
+
+    return segments
+
+
+def segment_signal(signal: np.ndarray) -> list[np.ndarray]:
+    signal = _normalize_signal(signal)
+    segments: list[np.ndarray] = []
+
+    for region_start, region_end in _speech_regions(signal):
+        for segment_start, segment_end in _segment_indices_from_region(
+            region_start, region_end
+        ):
+            segment = signal[segment_start:segment_end]
+            if segment.size >= CONFIG.frame_length:
+                segments.append(segment)
+
+    return segments or [signal]
+
+
+def extract_segment_feature_matrix(audio_path: Path | str) -> np.ndarray:
+    signal = load_audio_signal(audio_path)
+    segments = segment_signal(signal)
+    return np.vstack(
+        [extract_feature_vector_from_signal(segment) for segment in segments]
+    )
 
 
 def save_feature_schema(artifact_dir: Path) -> None:
@@ -162,6 +292,10 @@ def save_feature_schema(artifact_dir: Path) -> None:
         "sample_rate_hz": CONFIG.sample_rate,
         "frame_duration_seconds": CONFIG.frame_duration,
         "hop_duration_seconds": CONFIG.hop_duration,
+        "segment_duration_seconds": CONFIG.segment_duration,
+        "segment_hop_seconds": CONFIG.segment_hop_duration,
+        "minimum_segment_duration_seconds": CONFIG.min_segment_duration,
+        "merge_silence_duration_seconds": CONFIG.merge_silence_duration,
         "lpc_order": CONFIG.lpc_order,
         "mel_filter_banks": CONFIG.n_mels,
         "feature_names": FEATURE_NAMES,
@@ -174,10 +308,14 @@ def save_feature_schema(artifact_dir: Path) -> None:
 
 def discover_training_files(dataset_root: Path) -> list[tuple[Path, str]]:
     top_level_directories = sorted(
-        child for child in dataset_root.iterdir() if child.is_dir() and not child.name.startswith(".")
+        child
+        for child in dataset_root.iterdir()
+        if child.is_dir() and not child.name.startswith(".")
     )
     top_level_audio = [
-        child for child in dataset_root.iterdir() if child.is_file() and child.suffix.lower() in AUDIO_EXTENSIONS
+        child
+        for child in dataset_root.iterdir()
+        if child.is_file() and child.suffix.lower() in AUDIO_EXTENSIONS
     ]
 
     if len(top_level_directories) == 1 and not top_level_audio:
@@ -206,17 +344,22 @@ def train_speaker_identifier(dataset_root: Path, artifact_dir: Path) -> dict:
             "Use .wav, .mp3, or .flac files grouped by speaker directory."
         )
 
-    speaker_counts: dict[str, int] = {}
+    speaker_segment_counts: dict[str, int] = {}
+    speaker_file_counts: dict[str, int] = {}
     features: list[np.ndarray] = []
     labels: list[str] = []
 
     for audio_path, speaker_label in training_files:
-        feature_vector = extract_feature_vector(audio_path)
-        features.append(feature_vector)
-        labels.append(speaker_label)
-        speaker_counts[speaker_label] = speaker_counts.get(speaker_label, 0) + 1
+        segment_feature_matrix = extract_segment_feature_matrix(audio_path)
+        features.extend(segment_feature_matrix)
+        labels.extend([speaker_label] * int(segment_feature_matrix.shape[0]))
+        speaker_segment_counts[speaker_label] = (
+            speaker_segment_counts.get(speaker_label, 0)
+            + int(segment_feature_matrix.shape[0])
+        )
+        speaker_file_counts[speaker_label] = speaker_file_counts.get(speaker_label, 0) + 1
 
-    if len(speaker_counts) < 2:
+    if len(speaker_segment_counts) < 2:
         raise ValueError("Training requires at least two speaker folders.")
 
     feature_matrix = np.vstack(features)
@@ -240,13 +383,27 @@ def train_speaker_identifier(dataset_root: Path, artifact_dir: Path) -> dict:
     save_feature_schema(artifact_dir)
 
     manifest = {
-        "speaker_count": len(speaker_counts),
+        "speaker_count": len(speaker_segment_counts),
+        "source_file_count": len(training_files),
         "sample_count": int(feature_matrix.shape[0]),
         "feature_dimension": int(feature_matrix.shape[1]),
         "probability_threshold_percent": int(PROBABILITY_THRESHOLD * 100),
+        "segmentation": {
+            "enabled": True,
+            "segment_duration_seconds": CONFIG.segment_duration,
+            "segment_hop_seconds": CONFIG.segment_hop_duration,
+            "minimum_segment_duration_seconds": CONFIG.min_segment_duration,
+            "merge_silence_duration_seconds": CONFIG.merge_silence_duration,
+            "activity_gate": "Short-term energy thresholding before sliding-window segmentation",
+        },
         "speakers": [
-            {"name": speaker_name, "utterances": utterance_count}
-            for speaker_name, utterance_count in sorted(speaker_counts.items())
+            {
+                "name": speaker_name,
+                "segments": speaker_segment_counts[speaker_name],
+                "utterances": speaker_segment_counts[speaker_name],
+                "source_files": speaker_file_counts.get(speaker_name, 0),
+            }
+            for speaker_name in sorted(speaker_segment_counts)
         ],
         "classifier": "Support Vector Machine (rbf kernel, probability=True)",
         "scaler": "StandardScaler",
@@ -292,36 +449,52 @@ def _nearest_neighbor_radius(class_vectors: np.ndarray) -> float:
     return max(percentile_radius, spread_radius)
 
 
-def _query_to_class_distance(query_vector: np.ndarray, class_vectors: np.ndarray) -> float:
+def _segment_to_class_distances(
+    query_vectors: np.ndarray, class_vectors: np.ndarray
+) -> np.ndarray:
     if class_vectors.size == 0:
-        return float("inf")
+        return np.asarray([np.inf], dtype=np.float32)
 
-    return float(pairwise_distances(query_vector.reshape(1, -1), class_vectors).min())
+    return pairwise_distances(query_vectors, class_vectors).min(axis=1)
 
 
 def predict_speaker(audio_path: Path, artifact_dir: Path) -> dict:
     if not artifacts_exist(artifact_dir):
         raise FileNotFoundError("Model artifacts are missing. Train the system first.")
 
+    training_manifest = load_training_manifest(artifact_dir)
     classifier: SVC = joblib.load(artifact_dir / MODEL_FILENAME)
     scaler: StandardScaler = joblib.load(artifact_dir / SCALER_FILENAME)
     encoder: LabelEncoder = joblib.load(artifact_dir / ENCODER_FILENAME)
     training_features = np.load(artifact_dir / FEATURES_FILENAME)
     training_labels = np.load(artifact_dir / LABELS_FILENAME)
 
-    feature_vector = extract_feature_vector(audio_path).reshape(1, -1)
-    scaled_feature_vector = scaler.transform(feature_vector)
+    feature_matrix = extract_segment_feature_matrix(audio_path)
+    scaled_feature_matrix = scaler.transform(feature_matrix)
     scaled_training_features = scaler.transform(training_features)
 
-    probabilities = classifier.predict_proba(scaled_feature_vector)[0]
-    predicted_index = int(np.argmax(probabilities))
+    probability_matrix = classifier.predict_proba(scaled_feature_matrix)
+    mean_probabilities = np.mean(probability_matrix, axis=0)
+    predicted_index = int(np.argmax(mean_probabilities))
     predicted_class = int(classifier.classes_[predicted_index])
-    confidence = float(probabilities[predicted_index])
+    confidence = float(mean_probabilities[predicted_index])
     predicted_label = encoder.inverse_transform([predicted_class])[0]
+
     class_vectors = scaled_training_features[training_labels == predicted_label]
-    nearest_distance = _query_to_class_distance(scaled_feature_vector[0], class_vectors)
-    speaker_radius = _nearest_neighbor_radius(class_vectors)
-    within_speaker_profile = nearest_distance <= speaker_radius
+    segment_distances = _segment_to_class_distances(scaled_feature_matrix, class_vectors)
+    acoustic_distance = float(np.median(segment_distances))
+    speaker_metadata = {
+        speaker["name"]: speaker for speaker in training_manifest.get("speakers", [])
+    }
+    source_file_count = int(
+        speaker_metadata.get(predicted_label, {}).get("source_files", 0)
+    )
+    speaker_radius = (
+        float("inf")
+        if source_file_count <= 1
+        else _nearest_neighbor_radius(class_vectors)
+    )
+    within_speaker_profile = acoustic_distance <= speaker_radius
     recognized = confidence >= PROBABILITY_THRESHOLD and within_speaker_profile
 
     rejection_reason = None
@@ -335,7 +508,8 @@ def predict_speaker(audio_path: Path, artifact_dir: Path) -> dict:
         "speaker": predicted_label if recognized else None,
         "confidence": round(confidence * 100, 2),
         "threshold": round(PROBABILITY_THRESHOLD * 100, 2),
-        "acoustic_distance": round(nearest_distance, 3),
+        "segment_count": int(feature_matrix.shape[0]),
+        "acoustic_distance": round(acoustic_distance, 3),
         "speaker_profile_radius": (
             round(speaker_radius, 3) if np.isfinite(speaker_radius) else None
         ),

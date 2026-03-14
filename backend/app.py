@@ -101,6 +101,10 @@ def train():
             "training_summary": manifest,
             "feature_dimension": feature_dimension(),
             "feature_pipeline": {
+                "segmentation": (
+                    "Long recordings are split into voiced 3-second windows with 1.5-second "
+                    "hop before feature extraction"
+                ),
                 "time_domain": [
                     "Short-term average energy (mean and standard deviation)",
                     "Zero crossing rate (mean and standard deviation)",
